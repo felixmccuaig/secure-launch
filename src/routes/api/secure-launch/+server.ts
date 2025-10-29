@@ -1,7 +1,7 @@
 import { json } from "@sveltejs/kit";
 import type { RequestHandler } from "./$types";
 import { webcrypto } from "node:crypto";
-import { ENCRYPTION_KEY, LYREBIRD_URL } from "$env/static/private";
+import { LYREBIRD_PUBLIC_KEY, LYREBIRD_URL } from "$env/static/private";
 
 interface PatientData {
   PAT_FIRST_NAME: string;
@@ -16,77 +16,169 @@ interface PatientData {
 }
 
 /**
- * Encrypts patient data using AES-256-CBC encryption
- * This matches the encryption format expected by Lyrebird's secure launch
+ * Encrypted payload structure for V2 (ECIES)
  */
-async function encryptPatientData(
-  data: PatientData,
-  keyHex: string,
-): Promise<string> {
-  // Convert data to form-encoded string (key1=value1&key2=value2)
-  const dataStr = Object.entries(data)
-    .map(([key, value]) => `${key}=${value}`)
-    .join("&");
-
-  // Generate random IV (16 bytes)
-  const iv = webcrypto.getRandomValues(new Uint8Array(16));
-
-  // Import the encryption key
-  const key = Buffer.from(keyHex, "hex");
-  const cryptoKey = await webcrypto.subtle.importKey(
-    "raw",
-    key,
-    "AES-CBC",
-    false,
-    ["encrypt"],
-  );
-
-  // Encrypt the data
-  const encrypted = await webcrypto.subtle.encrypt(
-    {
-      name: "AES-CBC",
-      iv: iv,
-    },
-    cryptoKey,
-    new TextEncoder().encode(dataStr),
-  );
-
-  // Combine IV + ciphertext
-  const combined = new Uint8Array(iv.length + encrypted.byteLength);
-  combined.set(iv, 0);
-  combined.set(new Uint8Array(encrypted), iv.length);
-
-  // Base64 encode and URL encode
-  const base64 = Buffer.from(combined).toString("base64");
-  return encodeURIComponent(base64);
+interface EncryptedPayload {
+  version: "1.1";
+  ephemeralPublicKey: string; // Base64 encoded ephemeral public key (JWK)
+  ciphertext: string; // Base64 encoded encrypted data
+  iv: string; // Base64 encoded initialization vector for AES-GCM
+  authTag: string; // Base64 encoded authentication tag for AES-GCM
 }
 
 /**
- * Validates that an encryption key is in the correct format
+ * Derive AES-256-GCM key from ECDH shared secret
  */
-function isValidEncryptionKey(encryptionKey: string): boolean {
-  // Check if it's a valid hex string
-  if (!/^[0-9a-fA-F]+$/.test(encryptionKey)) {
+async function deriveAESKey(
+  privateKey: CryptoKey,
+  publicKey: CryptoKey,
+): Promise<CryptoKey> {
+  return await webcrypto.subtle.deriveKey(
+    {
+      name: "ECDH",
+      public: publicKey,
+    },
+    privateKey,
+    {
+      name: "AES-GCM",
+      length: 256, // 256-bit key
+    },
+    false, // not extractable
+    ["encrypt", "decrypt"],
+  );
+}
+
+/**
+ * Encrypts patient data using ECIES (Elliptic Curve Integrated Encryption Scheme)
+ * This is the V2 secure launch format using ECDH with P-256 curve
+ */
+async function encryptPatientData(
+  data: PatientData,
+  publicKeyJWK: JsonWebKey,
+): Promise<EncryptedPayload> {
+  // Generate ephemeral keypair for this encryption
+  const ephemeralKeyPair = await webcrypto.subtle.generateKey(
+    {
+      name: "ECDH",
+      namedCurve: "P-256", // NIST P-256 curve
+    },
+    true, // extractable
+    ["deriveKey", "deriveBits"],
+  );
+
+  // Export ephemeral keys
+  const ephemeralPublicKeyJWK = await webcrypto.subtle.exportKey(
+    "jwk",
+    ephemeralKeyPair.publicKey,
+  );
+  const ephemeralPrivateKeyJWK = await webcrypto.subtle.exportKey(
+    "jwk",
+    ephemeralKeyPair.privateKey,
+  );
+
+  // Import Lyrebird's public key
+  const lyrebirdPublicKey = await webcrypto.subtle.importKey(
+    "jwk",
+    publicKeyJWK,
+    {
+      name: "ECDH",
+      namedCurve: "P-256",
+    },
+    false,
+    [],
+  );
+
+  // Import ephemeral private key
+  const ephemeralPrivateKey = await webcrypto.subtle.importKey(
+    "jwk",
+    ephemeralPrivateKeyJWK,
+    {
+      name: "ECDH",
+      namedCurve: "P-256",
+    },
+    false,
+    ["deriveKey"],
+  );
+
+  // Derive shared AES key
+  const sharedKey = await deriveAESKey(
+    ephemeralPrivateKey,
+    lyrebirdPublicKey,
+  );
+
+  // Create payload with metadata
+  const timestamp = Date.now();
+  const payload = {
+    timestamp,
+    patientData: data,
+  };
+
+  // Convert to JSON string
+  const plaintext = JSON.stringify(payload);
+
+  // Generate random IV (12 bytes for AES-GCM)
+  const iv = webcrypto.getRandomValues(new Uint8Array(12));
+
+  // Encrypt with AES-GCM
+  const encrypted = await webcrypto.subtle.encrypt(
+    {
+      name: "AES-GCM",
+      iv: iv,
+      tagLength: 128, // 128-bit authentication tag
+    },
+    sharedKey,
+    new TextEncoder().encode(plaintext),
+  );
+
+  // AES-GCM returns ciphertext + auth tag combined
+  // Split them: last 16 bytes are the tag
+  const encryptedArray = new Uint8Array(encrypted);
+  const ciphertext = encryptedArray.slice(0, -16);
+  const authTag = encryptedArray.slice(-16);
+
+  return {
+    version: "1.1",
+    ephemeralPublicKey: Buffer.from(
+      JSON.stringify(ephemeralPublicKeyJWK),
+    ).toString("base64"),
+    ciphertext: Buffer.from(ciphertext).toString("base64"),
+    iv: Buffer.from(iv).toString("base64"),
+    authTag: Buffer.from(authTag).toString("base64"),
+  };
+}
+
+/**
+ * Validates that a public key is in the correct format (base64-encoded JWK)
+ */
+function isValidPublicKey(publicKey: string): boolean {
+  try {
+    // Decode base64
+    const decoded = globalThis.Buffer.from(publicKey, "base64").toString("utf-8");
+    const jwk = JSON.parse(decoded) as JsonWebKey;
+
+    // Validate it's an EC key with P-256 curve
+    return jwk.kty === "EC" && jwk.crv === "P-256" && !!jwk.x && !!jwk.y;
+  } catch {
     return false;
   }
-
-  // AES-256 requires 64 hex characters (32 bytes)
-  const validLengths = [32, 48, 64];
-  return validLengths.includes(encryptionKey.length);
 }
 
 export const POST: RequestHandler = async ({ request }) => {
   try {
-    // Validate encryption key
-    if (!ENCRYPTION_KEY || !isValidEncryptionKey(ENCRYPTION_KEY)) {
+    // Validate public key
+    if (!LYREBIRD_PUBLIC_KEY || !isValidPublicKey(LYREBIRD_PUBLIC_KEY)) {
       return json(
         {
           error:
-            "Invalid or missing ENCRYPTION_KEY. Must be a 32, 48, or 64 character hex string.",
+            "Invalid or missing LYREBIRD_PUBLIC_KEY. Must be a base64-encoded JWK with EC P-256 curve.",
         },
         { status: 500 },
       );
     }
+
+    // Parse Lyrebird's public key
+    const publicKeyJson = globalThis.Buffer.from(LYREBIRD_PUBLIC_KEY, "base64").toString("utf-8");
+    const publicKeyJWK = JSON.parse(publicKeyJson) as JsonWebKey;
 
     // Parse patient data from request
     const patientData: PatientData = await request.json();
@@ -112,16 +204,20 @@ export const POST: RequestHandler = async ({ request }) => {
       );
     }
 
-    // Encrypt the patient data
+    // Encrypt the patient data using ECIES
     const encryptedPayload = await encryptPatientData(
       patientData,
-      ENCRYPTION_KEY,
+      publicKeyJWK,
     );
 
-    // Generate the secure launch URL
-    const url = `${LYREBIRD_URL}/app?encryptedPayload=${encryptedPayload}`;
+    // Convert payload to JSON string and URL encode
+    const payloadJson = JSON.stringify(encryptedPayload);
+    const encodedPayload = encodeURIComponent(payloadJson);
 
-    return json({ url, encryptedPayload });
+    // Generate the secure launch URL
+    const url = `${LYREBIRD_URL}/app?encryptedPayload=${encodedPayload}`;
+
+    return json({ url, encryptedPayload: payloadJson });
   } catch (error) {
     console.error("Error generating secure launch URL:", error);
     return json(

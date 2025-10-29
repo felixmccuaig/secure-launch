@@ -191,17 +191,26 @@
     {/if}
 
     <div class="info-section">
-      <h3>How it works:</h3>
+      <h3>How it works (Secure Launch V2):</h3>
       <ol>
         <li>
-          Patient data is encrypted using AES-256-CBC with a shared encryption
-          key
+          <strong>Asymmetric Encryption:</strong> Uses ECDH with P-256 curve (public-key cryptography)
         </li>
-        <li>The encrypted payload is appended to the Lyrebird URL</li>
         <li>
-          Lyrebird decrypts the payload and pre-fills patient information
+          <strong>Ephemeral Keys:</strong> Each launch generates a new temporary keypair for forward secrecy
         </li>
-        <li>A patient record is automatically created in Lyrebird</li>
+        <li>
+          <strong>Authenticated Encryption:</strong> AES-256-GCM ensures both confidentiality and integrity
+        </li>
+        <li>
+          <strong>Timestamp Validation:</strong> 5-minute window prevents replay attacks
+        </li>
+        <li>
+          The encrypted payload is appended to the Lyrebird URL as a JSON object
+        </li>
+        <li>
+          Lyrebird decrypts the payload using its private key and pre-fills patient information
+        </li>
       </ol>
     </div>
   </main>
